@@ -3,17 +3,20 @@
 <head>
 <meta charset="UTF-8">
 <title>My Online Compiler</title>
+<script src="https://cdn.jsdelivr.net/npm/fflate@0.8.2/umd/index.js"></script>
 <style>
   body {
     font-family: system-ui, sans-serif;
-    max-width: 480px;
-    margin: 60px auto;
+    max-width: 520px;
+    margin: 50px auto;
     padding: 0 20px;
     color: #1a1a1a;
   }
   h1 { font-size: 1.4rem; }
-  label { display: block; margin-top: 16px; font-weight: 600; font-size: 0.9rem; }
-  select, input[type="file"] {
+  fieldset { border: 1px solid #ddd; border-radius: 8px; margin-top: 20px; }
+  legend { font-weight: 600; font-size: 0.85rem; padding: 0 6px; }
+  label { display: block; margin-top: 12px; font-weight: 600; font-size: 0.85rem; }
+  input[type="text"], input[type="password"], select, input[type="file"] {
     display: block;
     margin-top: 6px;
     width: 100%;
@@ -34,93 +37,208 @@
   #status { margin-top: 16px; font-size: 0.9rem; white-space: pre-wrap; }
   #status.error { color: #c0392b; }
   #status.success { color: #1e7d34; }
+  .hint { font-size: 0.75rem; color: #666; margin-top: 4px; }
 </style>
 </head>
 <body>
 
 <h1>Compile to Windows .exe</h1>
+<p class="hint">Runs on a free GitHub Actions Windows runner. Typically takes 1-5 minutes.</p>
 
-<label for="backendUrl">Backend URL</label>
-<input type="text" id="backendUrl" placeholder="https://your-backend-url.example.com" />
+<fieldset>
+  <legend>GitHub setup</legend>
 
-<label for="language">Language</label>
-<select id="language">
-  <option value="cpp">C++</option>
-  <option value="csharp">C#</option>
-  <option value="python">Python</option>
-</select>
+  <label for="token">Personal Access Token</label>
+  <input type="password" id="token" placeholder="ghp_..." />
+  <div class="hint">Fine-grained token scoped to this repo only, with Contents: Read/Write and Actions: Read/Write.</div>
 
-<label for="fileInput">Source file</label>
-<input type="file" id="fileInput" />
+  <label for="owner">Repo owner</label>
+  <input type="text" id="owner" placeholder="yourusername" />
+
+  <label for="repo">Repo name</label>
+  <input type="text" id="repo" placeholder="online-compiler" />
+
+  <label for="branch">Branch</label>
+  <input type="text" id="branch" placeholder="main" value="main" />
+</fieldset>
+
+<fieldset>
+  <legend>Compile job</legend>
+
+  <label for="language">Language</label>
+  <select id="language">
+    <option value="cpp">C++</option>
+    <option value="csharp">C#</option>
+    <option value="python">Python</option>
+  </select>
+
+  <label for="fileInput">Source file</label>
+  <input type="file" id="fileInput" />
+</fieldset>
 
 <button id="compileBtn">Compile</button>
 
 <div id="status"></div>
 
 <script>
-const backendUrlInput = document.getElementById('backendUrl');
-const languageSelect = document.getElementById('language');
-const fileInput = document.getElementById('fileInput');
-const compileBtn = document.getElementById('compileBtn');
-const statusEl = document.getElementById('status');
+const els = {
+  token: document.getElementById('token'),
+  owner: document.getElementById('owner'),
+  repo: document.getElementById('repo'),
+  branch: document.getElementById('branch'),
+  language: document.getElementById('language'),
+  fileInput: document.getElementById('fileInput'),
+  compileBtn: document.getElementById('compileBtn'),
+  status: document.getElementById('status'),
+};
 
-// Remember the backend URL between visits
-backendUrlInput.value = localStorage.getItem('compilerBackendUrl') || '';
+// Remember non-secret fields between visits. Token is intentionally NOT
+// persisted automatically for a bit of extra safety - re-enable if you want.
+['owner', 'repo', 'branch'].forEach(key => {
+  els[key].value = localStorage.getItem('gh_' + key) || els[key].value;
+  els[key].addEventListener('change', () => localStorage.setItem('gh_' + key, els[key].value));
+});
 
-compileBtn.addEventListener('click', async () => {
-  const backendUrl = backendUrlInput.value.trim().replace(/\/$/, '');
-  const language = languageSelect.value;
-  const file = fileInput.files[0];
+function setStatus(text, cls) {
+  els.status.textContent = text;
+  els.status.className = cls || '';
+}
 
-  statusEl.className = '';
-  statusEl.textContent = '';
+function ghHeaders(token) {
+  return {
+    Authorization: `Bearer ${token}`,
+    Accept: 'application/vnd.github+json',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+}
 
-  if (!backendUrl) {
-    statusEl.className = 'error';
-    statusEl.textContent = 'Enter your backend URL first.';
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function extFor(language) {
+  return { cpp: 'cpp', csharp: 'cs', python: 'py' }[language];
+}
+
+function sleep(ms) {
+  return new Promise(res => setTimeout(res, ms));
+}
+
+async function ghApi(url, token, options = {}) {
+  const res = await fetch(url, {
+    ...options,
+    headers: { ...ghHeaders(token), ...(options.headers || {}) },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`GitHub API error (${res.status}) on ${url}:\n${body}`);
+  }
+  return res;
+}
+
+els.compileBtn.addEventListener('click', async () => {
+  const token = els.token.value.trim();
+  const owner = els.owner.value.trim();
+  const repo = els.repo.value.trim();
+  const branch = els.branch.value.trim() || 'main';
+  const language = els.language.value;
+  const file = els.fileInput.files[0];
+
+  if (!token || !owner || !repo || !file) {
+    setStatus('Fill in the token, owner, repo, and pick a file first.', 'error');
     return;
   }
-  if (!file) {
-    statusEl.className = 'error';
-    statusEl.textContent = 'Choose a source file first.';
-    return;
-  }
 
-  localStorage.setItem('compilerBackendUrl', backendUrl);
-
-  const formData = new FormData();
-  formData.append('file', file);
-
-  compileBtn.disabled = true;
-  statusEl.textContent = 'Compiling... this can take a little while.';
+  els.compileBtn.disabled = true;
 
   try {
-    const response = await fetch(`${backendUrl}/compile/${language}`, {
-      method: 'POST',
-      body: formData,
+    const base = `https://api.github.com/repos/${owner}/${repo}`;
+    const sourcePath = `uploads/${Date.now()}_${crypto.randomUUID()}.${extFor(language)}`;
+
+    // 1. Commit the source file
+    setStatus('Uploading source file to the repo...');
+    const content = await fileToBase64(file);
+    await ghApi(`${base}/contents/${sourcePath}`, token, {
+      method: 'PUT',
+      body: JSON.stringify({
+        message: `Add source for compile job`,
+        content,
+        branch,
+      }),
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      throw new Error(errText);
+    // 2. Trigger the workflow
+    setStatus('Triggering the build...');
+    const dispatchTime = new Date();
+    await ghApi(`${base}/actions/workflows/compile.yml/dispatches`, token, {
+      method: 'POST',
+      body: JSON.stringify({
+        ref: branch,
+        inputs: { language, source_path: sourcePath },
+      }),
+    });
+
+    // 3. Find the run that was just triggered
+    setStatus('Waiting for the runner to pick up the job...');
+    let run = null;
+    for (let attempt = 0; attempt < 15 && !run; attempt++) {
+      await sleep(2000);
+      const res = await ghApi(
+        `${base}/actions/workflows/compile.yml/runs?event=workflow_dispatch&per_page=5`,
+        token
+      );
+      const data = await res.json();
+      run = data.workflow_runs.find(r => new Date(r.created_at) >= dispatchTime - 5000);
+    }
+    if (!run) throw new Error('Could not find the triggered workflow run. Check the Actions tab on GitHub.');
+
+    // 4. Poll until it's done
+    setStatus(`Build running (this can take 1-5 minutes)... [${run.html_url}]`);
+    let finished = null;
+    while (!finished) {
+      await sleep(5000);
+      const res = await ghApi(`${base}/actions/runs/${run.id}`, token);
+      const data = await res.json();
+      if (data.status === 'completed') finished = data;
+      else setStatus(`Build in progress: ${data.status}... [${run.html_url}]`);
     }
 
-    const blob = await response.blob();
+    if (finished.conclusion !== 'success') {
+      throw new Error(`Build finished with status "${finished.conclusion}". See details: ${run.html_url}`);
+    }
+
+    // 5. Grab the artifact
+    setStatus('Build succeeded, downloading result...');
+    const artifactsRes = await ghApi(`${base}/actions/runs/${run.id}/artifacts`, token);
+    const artifactsData = await artifactsRes.json();
+    const artifact = artifactsData.artifacts[0];
+    if (!artifact) throw new Error('No artifact was produced by the build.');
+
+    const zipRes = await ghApi(artifact.archive_download_url, token);
+    const zipBuf = new Uint8Array(await zipRes.arrayBuffer());
+    const unzipped = fflate.unzipSync(zipBuf);
+    const exeName = Object.keys(unzipped).find(n => n.endsWith('.exe'));
+    if (!exeName) throw new Error('No .exe found inside the build artifact.');
+
+    const blob = new Blob([unzipped[exeName]], { type: 'application/octet-stream' });
     const downloadUrl = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = downloadUrl;
-    a.download = language === 'python' ? 'script.exe' : 'output.exe';
+    a.download = 'output.exe';
     document.body.appendChild(a);
     a.click();
     a.remove();
 
-    statusEl.className = 'success';
-    statusEl.textContent = 'Done — download started.';
+    setStatus('Done - download started.', 'success');
   } catch (err) {
-    statusEl.className = 'error';
-    statusEl.textContent = 'Failed:\n' + err.message;
+    setStatus('Failed:\n' + err.message, 'error');
   } finally {
-    compileBtn.disabled = false;
+    els.compileBtn.disabled = false;
   }
 });
 </script>
